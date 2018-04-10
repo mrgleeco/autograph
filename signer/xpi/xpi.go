@@ -147,10 +147,15 @@ func (s *PKCS7Signer) SignFile(input []byte, options interface{}) (signer.Signed
 	var (
 		signedFile []byte
 	)
-	manifest, sigfile, err := makeJARManifests(input)
+	manifest, err := makeJARManifest(input)
 	if err != nil {
-		return nil, errors.Wrap(err, "xpi: cannot make JAR manifests from XPI")
+		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest from XPI")
 	}
+	sigfile, err := makeJARSignature(manifest)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
+	}
+
 	p7sig, err := s.signData(sigfile, options)
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: failed to sign XPI")

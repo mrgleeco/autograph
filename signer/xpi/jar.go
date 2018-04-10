@@ -12,14 +12,33 @@ import (
 	"strings"
 )
 
+
+// makeJARManifests writes hashes for all entries in a zip to a
+// manifest file then hashes the manifest file to write a signature
+// file and returns both
 func makeJARManifests(input []byte) (manifest, sigfile []byte, err error) {
+	manifest, err = makeJARManifest(input)
+	if err != nil {
+		return manifest, sigfile, err
+	}
+
+	sigfile, err = makeJARSignature(manifest)
+	if err != nil {
+		return manifest, sigfile, err
+	}
+
+	return
+}
+
+// makeJARManifest calculates a sha1 and sha256 hash for each zip entry and writes them to a manifest file
+func makeJARManifest(input []byte) (manifest []byte, err error) {
 	inputReader := bytes.NewReader(input)
 	r, err := zip.NewReader(inputReader, int64(len(input)))
 	if err != nil {
 		return
 	}
 
-	// first generate the manifest file by calculating a sha1 and sha256 hash for each zip entry
+	// generate the manifest file by calculating a sha1 and sha256 hash for each zip entry
 	mw := bytes.NewBuffer(manifest)
 	manifest = []byte(fmt.Sprintf("Manifest-Version: 1.0\n\n"))
 
@@ -34,11 +53,11 @@ func makeJARManifests(input []byte) (manifest, sigfile []byte, err error) {
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return manifest, sigfile, err
+			return manifest, err
 		}
 		data, err := ioutil.ReadAll(rc)
 		if err != nil {
-			return manifest, sigfile, err
+			return manifest, err
 		}
 		fmt.Fprintf(mw, "Name: %s\nDigest-Algorithms: SHA1 SHA256\n", f.Name)
 		h1 := sha1.New()
@@ -51,7 +70,11 @@ func makeJARManifests(input []byte) (manifest, sigfile []byte, err error) {
 	manifestBody := mw.Bytes()
 	manifest = append(manifest, manifestBody...)
 
-	// then calculate a signature file by hashing the manifest with sha1 and sha256
+	return
+}
+
+// makeJARSignature calculates a signature file by hashing the manifest with sha1 and sha256
+func makeJARSignature(manifest []byte) (sigfile []byte, err error) {
 	sw := bytes.NewBuffer(sigfile)
 	fmt.Fprint(sw, "Signature-Version: 1.0\n")
 	h1 := sha1.New()
