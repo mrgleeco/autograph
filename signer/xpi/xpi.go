@@ -179,19 +179,27 @@ func (s *PKCS7Signer) SignData(sigfile []byte, options interface{}) (signer.Sign
 	return sig, nil
 }
 
-func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, error) {
+func (s *PKCS7Signer) makeEE(options interface{}) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
 	opt, err := GetOptions(options)
 	if err != nil {
-		return nil, errors.Wrap(err, "xpi: cannot get options")
+		return nil, nil, errors.Wrap(err, "xpi: cannot get options")
 	}
 	cn := opt.ID
 	if s.EndEntityCN != "" {
 		cn = s.EndEntityCN
 	}
 	if cn == "" {
-		return nil, errors.New("xpi: missing common name")
+		return nil, nil, errors.New("xpi: missing common name")
 	}
-	eeCert, eeKey, err := s.MakeEndEntity(cn)
+	eeCert, eeKey, err = s.MakeEndEntity(cn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return
+}
+
+func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, error) {
+	eeCert, eeKey, err := s.makeEE(options)
 	if err != nil {
 		return nil, err
 	}
