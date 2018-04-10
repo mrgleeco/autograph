@@ -151,12 +151,17 @@ func (s *PKCS7Signer) SignFile(input []byte, options interface{}) (signer.Signed
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest from XPI")
 	}
+
+	eeCert, eeKey, err := s.makeEE(options)
+	if err != nil {
+		return nil, err
+	}
 	sigfile, err := makeJARSignature(manifest)
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
 	}
 
-	p7sig, err := s.signData(sigfile, options)
+	p7sig, err := s.signDataWithEE(sigfile, eeCert, eeKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: failed to sign XPI")
 	}
@@ -198,11 +203,7 @@ func (s *PKCS7Signer) makeEE(options interface{}) (eeCert *x509.Certificate, eeK
 	return
 }
 
-func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, error) {
-	eeCert, eeKey, err := s.makeEE(options)
-	if err != nil {
-		return nil, err
-	}
+func (s *PKCS7Signer) signDataWithEE(sigfile []byte, eeCert *x509.Certificate, eeKey crypto.PrivateKey) ([]byte, error) {
 	toBeSigned, err := pkcs7.NewSignedData(sigfile)
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: cannot initialize signed data")
@@ -219,6 +220,14 @@ func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, err
 		return nil, errors.Wrap(err, "xpi: cannot finish signing data")
 	}
 	return p7sig, nil
+}
+
+func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, error) {
+	eeCert, eeKey, err := s.makeEE(options)
+	if err != nil {
+		return nil, err
+	}
+	return s.signDataWithEE(sigfile, eeCert, eeKey)
 }
 
 // Options contains specific parameters used to sign XPIs
