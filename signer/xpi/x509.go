@@ -54,7 +54,12 @@ func (s *PKCS7Signer) getRsaKey(size int) (*rsa.PrivateKey, error) {
 //
 // The signed certificate and private key are returned.
 func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
-	var derCert []byte
+	var (
+		issuerPrivateKey crypto.PrivateKey
+		eePublicKey crypto.PublicKey
+		derCert []byte
+	)
+
 	template := x509.Certificate{
 		// The maximum length of a serial number per rfc 5280 is 20 bytes / 160 bits
 		// https://tools.ietf.org/html/rfc5280#section-4.1.2.2
@@ -80,7 +85,8 @@ func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey 
 			err = errors.Wrapf(err, "xpi.MakeEndEntity: failed to generate rsa private key of size %d", size)
 			return
 		}
-		derCert, err = x509.CreateCertificate(rand.Reader, &template, s.issuerCert, eeKey.(*rsa.PrivateKey).Public(), s.issuerKey.(*rsa.PrivateKey))
+		issuerPrivateKey = s.issuerKey.(*rsa.PrivateKey)
+		eePublicKey = eeKey.(*rsa.PrivateKey).Public()
 	case *ecdsa.PrivateKey:
 		curve := s.issuerKey.(*ecdsa.PrivateKey).Curve
 		eeKey, err = ecdsa.GenerateKey(curve, rand.Reader)
@@ -88,8 +94,10 @@ func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey 
 			err = errors.Wrapf(err, "xpi.MakeEndEntity: failed to generate ecdsa private key on curve %s", curve.Params().Name)
 			return
 		}
-		derCert, err = x509.CreateCertificate(rand.Reader, &template, s.issuerCert, eeKey.(*ecdsa.PrivateKey).Public(), s.issuerKey.(*ecdsa.PrivateKey))
+		issuerPrivateKey = s.issuerKey.(*ecdsa.PrivateKey)
+		eePublicKey = eeKey.(*ecdsa.PrivateKey).Public()
 	}
+	derCert, err = x509.CreateCertificate(rand.Reader, &template, s.issuerCert, eePublicKey, issuerPrivateKey)
 	if err != nil {
 		err = errors.Wrapf(err, "xpi.MakeEndEntity: failed to create certificate")
 		return
