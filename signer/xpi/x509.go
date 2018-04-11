@@ -46,21 +46,10 @@ func (s *PKCS7Signer) getRsaKey(size int) (*rsa.PrivateKey, error) {
 	}
 }
 
-// MakeEndEntity generates a private key and certificate ready to sign a given XPI.
-// The subject CN of the certificate is taken from the `cn` string passed as argument.
-// The type of key is identical to the key of the signer that issues the certificate,
-// if the signer uses an RSA 2048 key, so will the end-entity. The signature algorithm
-// and expiration date are also copied over from the issuer.
-//
-// The signed certificate and private key are returned.
-func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
-	var (
-		issuerPrivateKey crypto.PrivateKey
-		eePublicKey crypto.PublicKey
-		derCert []byte
-	)
 
-	template := x509.Certificate{
+// makeTemplate returns a pointer to a template for an x509.Certificate EE
+func (s *PKCS7Signer) makeTemplate(cn string) (*x509.Certificate) {
+	return &x509.Certificate{
 		// The maximum length of a serial number per rfc 5280 is 20 bytes / 160 bits
 		// https://tools.ietf.org/html/rfc5280#section-4.1.2.2
 		// Setting it to nanoseconds guarantees we'll never have two conflicting serials
@@ -77,6 +66,24 @@ func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey 
 		NotAfter:           time.Now().Add(8760 * time.Hour), // one year
 		SignatureAlgorithm: s.issuerCert.SignatureAlgorithm,
 	}
+}
+
+// MakeEndEntity generates a private key and certificate ready to sign a given XPI.
+// The subject CN of the certificate is taken from the `cn` string passed as argument.
+// The type of key is identical to the key of the signer that issues the certificate,
+// if the signer uses an RSA 2048 key, so will the end-entity. The signature algorithm
+// and expiration date are also copied over from the issuer.
+//
+// The signed certificate and private key are returned.
+func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
+	var (
+		issuerPrivateKey crypto.PrivateKey
+		eePublicKey crypto.PublicKey
+		derCert []byte
+	)
+
+	template := s.makeTemplate(cn)
+
 	switch s.issuerKey.(type) {
 	case *rsa.PrivateKey:
 		size := s.issuerKey.(*rsa.PrivateKey).N.BitLen()
@@ -97,7 +104,7 @@ func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey 
 		issuerPrivateKey = s.issuerKey.(*ecdsa.PrivateKey)
 		eePublicKey = eeKey.(*ecdsa.PrivateKey).Public()
 	}
-	derCert, err = x509.CreateCertificate(rand.Reader, &template, s.issuerCert, eePublicKey, issuerPrivateKey)
+	derCert, err = x509.CreateCertificate(rand.Reader, template, s.issuerCert, eePublicKey, issuerPrivateKey)
 	if err != nil {
 		err = errors.Wrapf(err, "xpi.MakeEndEntity: failed to create certificate")
 		return
