@@ -124,13 +124,13 @@ func (s *PKCS7Signer) MakeEndEntity(cn string) (eeCert *x509.Certificate, eeKey 
 
 // KeyType is the type to use in keyOptions to tell MakeDEREndEntity
 // which type of crypto.PrivateKey to generate
-type KeyType string
+type KeyType int
 const (
 	// keyTypeRSA is the keyOptions.keyType to generate an rsa.PrivateKey
-	keyTypeRSA KeyType = "rsa"
+	keyTypeRSA KeyType = iota
 
 	// keyTypeECDSA is the keyOptions.keyType to generate an ecdsa.PrivateKey
-	keyTypeECDSA KeyType = "ecdsa"
+	keyTypeECDSA KeyType = iota
 )
 
 // keyOptions
