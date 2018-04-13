@@ -36,6 +36,9 @@ const (
 	// ModeHotFix represents a signer that issues signatures for
 	// Firefox HotFixes
 	ModeHotFix = "hotfix"
+
+	// SubSignerType all subsigners must be this type
+	SubSignerType = "cose"
 )
 
 type EESignerConfig struct {
@@ -210,7 +213,63 @@ var supportedCOSEAlgorithms = map[*cose.Algorithm]bool{
 }
 
 func newCOSESigner(conf signer.Configuration) (s *COSESigner, err error) {
-	// can't specify the COSESigner config in signer.go so parse and validate here
+	if conf.Type != SubSignerType {
+		return nil, errors.Errorf("xpi: invalid sub signer type %q, must be %q", conf.Type, SubSignerType)
+	}
+	s.Type = conf.Type
+	if conf.PrivateKey == "" {
+		return nil, errors.New("xpi: missing private key in sub signer configuration")
+	}
+	s.PrivateKey = conf.PrivateKey
+	s.issuerKey, err = signer.ParsePrivateKey([]byte(conf.PrivateKey))
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: failed to parse private key")
+	}
+	block, _ := pem.Decode([]byte(conf.Certificate))
+	if block == nil {
+		return nil, errors.New("xpi: failed to parse certificate PEM")
+	}
+	s.issuerCert, err = x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: could not parse X.509 certificate")
+	}
+	// some sanity checks for the signer cert
+	if !s.issuerCert.IsCA {
+		return nil, errors.New("xpi: sub signer certificate must have CA constraint set to true")
+	}
+	if time.Now().Before(s.issuerCert.NotBefore) || time.Now().After(s.issuerCert.NotAfter) {
+		return nil, errors.New("xpi: sub signer certificate is not currently valid")
+	}
+	if s.issuerCert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, errors.New("xpi: sub signer certificate is missing certificate signing key usage")
+	}
+	hasCodeSigning := false
+	for _, eku := range s.issuerCert.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageCodeSigning {
+			hasCodeSigning = true
+			break
+		}
+	}
+	if !hasCodeSigning {
+		return nil, errors.New("xpi: sub signer certificate does not have code signing EKU")
+	}
+	switch conf.Mode {
+	case ModeAddOn:
+		s.OU = "Production"
+	case ModeExtension:
+		s.OU = "Mozilla Extensions"
+	case ModeSystemAddOn:
+		s.OU = "Mozilla Components"
+	case ModeHotFix:
+		// FIXME: this also needs to pin the signing key somehow
+		s.OU = "Production"
+		s.EndEntityCN = "firefox-hotfix@mozilla.org"
+	default:
+		return nil, errors.Errorf("xpi: unknown signer mode %q, must be 'add-on', 'extension', 'system add-on' or 'hotfix'", conf.Mode)
+	}
+	s.Mode = conf.Mode
+
+	// COSE Alg validation
 	alg, algErr := cose.GetAlgByName(string(conf.Algorithm))
 	if algErr != nil {
 		err = errors.Wrapf(algErr, "xpi: unrecognized algorithm COSE Signing algorithm")
