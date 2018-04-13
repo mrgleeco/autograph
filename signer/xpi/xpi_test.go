@@ -193,7 +193,7 @@ func TestSignAndVerifyWithOpenSSL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pem.Encode(fd, &pem.Block{Type: "CERTIFICATE", Bytes: s.issuerCert.Raw})
+	pem.Encode(fd, &pem.Block{Type: "CERTIFICATE", Bytes: s.maybePKCS7Signer.issuerCert.Raw})
 	fd.Close()
 
 	// call openssl to verify the signature on the content using the root
@@ -335,11 +335,11 @@ func TestRsaCaching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("signer initialization failed with: %v", err)
 	}
-	go s.populateRsaCache(s.issuerKey.(*rsa.PrivateKey).N.BitLen())
+	go s.maybePKCS7Signer.populateRsaCache(s.maybePKCS7Signer.issuerKey.(*rsa.PrivateKey).N.BitLen())
 	time.Sleep(10 * time.Second)
 	// retrieving a rsa key should be really fast now
 	start := time.Now()
-	key, err := s.getRsaKey(s.issuerKey.(*rsa.PrivateKey).N.BitLen())
+	key, err := s.maybePKCS7Signer.getRsaKey(s.maybePKCS7Signer.issuerKey.(*rsa.PrivateKey).N.BitLen())
 	if err != nil {
 		t.Fatalf("signer initialization failed with: %v", err)
 	}
@@ -348,8 +348,8 @@ func TestRsaCaching(t *testing.T) {
 		t.Fatal("key retrieval from cache took more than 10ms")
 	}
 	t.Logf("retrieved rsa key from cache in %s", elapsed)
-	if key.N.BitLen() != s.issuerKey.(*rsa.PrivateKey).N.BitLen() {
-		t.Fatalf("key bitlen does not match. expected %d, got %d", s.issuerKey.(*rsa.PrivateKey).N.BitLen(), key.N.BitLen())
+	if key.N.BitLen() != s.maybePKCS7Signer.issuerKey.(*rsa.PrivateKey).N.BitLen() {
+		t.Fatalf("key bitlen does not match. expected %d, got %d", s.maybePKCS7Signer.issuerKey.(*rsa.PrivateKey).N.BitLen(), key.N.BitLen())
 	}
 }
 
