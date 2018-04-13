@@ -26,6 +26,9 @@ type Configuration struct {
 	PublicKey   string `json:"publickey,omitempty"`
 	Certificate string `json:"certificate,omitempty"`
 	X5U         string `json:"x5u,omitempty"`
+
+	COSESigners []Configuration `json:"sub_signers"`
+	Algorithm   string `json:"algorithm,omitempty"`
 }
 
 // Signer is an interface to a configurable issuer of digital signatures

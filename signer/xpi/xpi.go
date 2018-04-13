@@ -38,9 +38,7 @@ const (
 	ModeHotFix = "hotfix"
 )
 
-// A PKCS7Signer is configured to issue PKCS7 detached signatures
-// for Firefox Add-ons of various types.
-type PKCS7Signer struct {
+type EESignerConfig struct {
 	signer.Configuration
 	issuerKey  crypto.PrivateKey
 	issuerCert *x509.Certificate
@@ -54,14 +52,56 @@ type PKCS7Signer struct {
 	// the ID will be left blank and provided by the requester of the
 	// signature, but for hotfix signers, it is set to a specific value.
 	EndEntityCN string
+}
+
+// A PKCS7Signer is configured to issue PKCS7 detached signatures
+// for Firefox Add-ons of various types.
+type PKCS7Signer struct {
+	EESignerConfig
 
 	// rsa cache is used to pre-generate RSA private keys and speed up
 	// the signing process
 	rsaCache chan *rsa.PrivateKey
 }
 
-// New initializes an XPI signer using a configuration
-func New(conf signer.Configuration) (s *PKCS7Signer, err error) {
+// A COSESigner adds COSE signatures to a SignMessage
+type COSESigner struct {
+	EESignerConfig
+
+	// the COSE Algorithm to use for signing
+	alg cose.Algorithm
+}
+
+// An XPISigner issues COSE signatures and an optional PKCS7 detached
+// signature for Firefox Add-ons.
+type XPISigner struct {
+	maybePKCS7Signer *PKCS7Signer
+	coseSigners []COSESigner
+}
+
+func (s *XPISigner) Config() signer.Configuration {
+	if s.maybePKCS7Signer != nil {
+		return s.maybePKCS7Signer.Config()
+	} else {
+		panic("not implemented")
+	}
+}
+func (s *XPISigner) SignFile(input []byte, options interface{}) (signer.SignedFile, error) {
+	if s.maybePKCS7Signer != nil {
+		return s.maybePKCS7Signer.SignFile(input, options)
+	} else {
+		panic("not implemented")
+	}
+}
+func (s *XPISigner) SignData(sigfile []byte, options interface{}) (signer.Signature, error) {
+	if s.maybePKCS7Signer != nil {
+		return s.maybePKCS7Signer.SignData(sigfile, options)
+	} else {
+		panic("not implemented")
+	}
+}
+
+func newPKCS7Signer(conf signer.Configuration) (s *PKCS7Signer, err error) {
 	s = new(PKCS7Signer)
 	if conf.Type != Type {
 		return nil, errors.Errorf("xpi: invalid type %q, must be %q", conf.Type, Type)
@@ -128,6 +168,57 @@ func New(conf signer.Configuration) (s *PKCS7Signer, err error) {
 	if _, ok := s.issuerKey.(*rsa.PrivateKey); ok {
 		s.rsaCache = make(chan *rsa.PrivateKey, 100)
 		go s.populateRsaCache(s.issuerKey.(*rsa.PrivateKey).N.BitLen())
+	}
+
+	return
+}
+
+// New initializes an XPI signer using a configuration
+func New(conf signer.Configuration) (s *XPISigner, err error) {
+	var (
+		pkcs7Signer *PKCS7Signer
+	)
+	s = new(XPISigner)
+
+	if len(conf.COSESigners) > 0 {
+		for _, coseConf := range conf.COSESigners {
+			coseSigner, coseErr := newCOSESigner(coseConf)
+			if coseErr != nil {
+				err = errors.Wrapf(coseErr, "xpi: error parsing COSESigner conf")
+				return
+			}
+			s.coseSigners = append(s.coseSigners, *coseSigner)
+		}
+	}
+
+	pkcs7Signer, err = newPKCS7Signer(conf)
+	if err != nil && len(s.coseSigners) < 1 {  // errors are OK if we have a COSESigner
+		err = err
+		return
+	} else if err == nil {
+		s.maybePKCS7Signer = pkcs7Signer
+	}
+
+	return
+}
+
+var supportedCOSEAlgorithms = map[*cose.Algorithm]bool{
+	cose.GetAlgByNameOrPanic("PS256"): true,
+	cose.GetAlgByNameOrPanic("ES256"): true,
+	cose.GetAlgByNameOrPanic("ES384"): true,
+	cose.GetAlgByNameOrPanic("ES512"): true,
+}
+
+func newCOSESigner(conf signer.Configuration) (s *COSESigner, err error) {
+	// can't specify the COSESigner config in signer.go so parse and validate here
+	alg, algErr := cose.GetAlgByName(string(conf.Algorithm))
+	if algErr != nil {
+		err = errors.Wrapf(algErr, "xpi: unrecognized algorithm COSE Signing algorithm")
+		return
+	}
+	if _, exists := supportedCOSEAlgorithms[alg]; !exists {
+		err = errors.Wrapf(algErr, "xpi: COSE algorithm is not supported")
+		return
 	}
 
 	return
@@ -287,7 +378,7 @@ type Options struct {
 }
 
 // GetDefaultOptions returns default options of the signer
-func (s *PKCS7Signer) GetDefaultOptions() interface{} {
+func (s *XPISigner) GetDefaultOptions() interface{} {
 	return Options{ID: "test@example.net"}
 }
 
