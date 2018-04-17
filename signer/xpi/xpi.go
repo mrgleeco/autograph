@@ -89,13 +89,68 @@ func (s *XPISigner) Config() signer.Configuration {
 		panic("not implemented")
 	}
 }
+// SignFile takes an unsigned zipped XPI file and returns a signed XPI file
 func (s *XPISigner) SignFile(input []byte, options interface{}) (signer.SignedFile, error) {
-	if s.maybePKCS7Signer != nil {
-		return s.maybePKCS7Signer.SignFile(input, options)
-	} else {
-		panic("not implemented")
+	var (
+		signedFile []byte
+		pkcs7manifest []byte
+		manifest []byte
+		metas = []Metafile{}
+	)
+	manifest, err := makeJARManifest(input)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest from XPI")
 	}
+
+	// TODO: generate EEs for each issuerID based on xpi subsigner configs and same IDs should return the same EE
+	// TODO: move from method from pkcs7signer (to handle when it is nil)
+	eeCert, eeKey, err := s.maybePKCS7Signer.makeEE(options)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(s.coseSigners) > 0 {
+		for _, coseSigner := range s.coseSigners {
+			coseSigner.signData(manifest, eeCert, eeKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		metas = append(metas, []Metafile{
+			{"META-INF/cose.manifest", manifest},
+			{"META-INF/cose.sig", cose.Marshal(msg)},
+		}...)
+	}
+	if s.maybePKCS7Signer != nil {
+		// TODO: add the cose files to the zipfile
+		// TODO: add entries for the cose files to the manifest as cose.manifest and cose.sig
+		// manifestWithCoseFiles :=
+
+		sigfile, err := makeJARSignature(manifestWithCoseFiles)
+		if err != nil {
+			return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
+		}
+
+		p7sig, err := s.maybePKCS7Signer.signDataWithEE(sigfile, eeCert, eeKey)
+		if err != nil {
+			return nil, errors.Wrap(err, "xpi: failed to sign XPI")
+		}
+
+		metas = append(metas, []Metafile{
+			{"META-INF/manifest.mf", manifest},
+			{"META-INF/mozilla.sf", sigfile},
+			{"META-INF/mozilla.rsa", p7sig},
+		}...)
+	}
+
+	signedFile, err = repackJARWithMetafiles(input, metas)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: failed to repack XPI")
+	}
+	return signedFile, nil
 }
+
 func (s *XPISigner) SignData(sigfile []byte, options interface{}) (signer.Signature, error) {
 	if s.maybePKCS7Signer != nil {
 		return s.maybePKCS7Signer.SignData(sigfile, options)
@@ -294,52 +349,11 @@ func (s *PKCS7Signer) Config() signer.Configuration {
 	}
 }
 
-// SignFile takes an unsigned zipped XPI file and returned a signed XPI file
-func (s *PKCS7Signer) SignFile(input []byte, options interface{}) (signer.SignedFile, error) {
-	var (
-		signedFile []byte
-	)
-	manifest, err := makeJARManifest(input)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest from XPI")
-	}
-
-	eeCert, eeKey, err := s.makeEE(options)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: COSE sign manifest
-	// coseMsg, err := s.signDataCOSE(manifest, eeCert, eeKey)
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// TODO: add entries for the cose files to the manifest as cose.manifest and cose.sig?
-	sigfile, err := makeJARSignature(manifest)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
-	}
-
-	// TODO: split this so we can use the certs in the XPI?
-	p7sig, err := s.signDataWithEE(sigfile, eeCert, eeKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: failed to sign XPI")
-	}
-
-	// TODO: cose files to repackJAR and update it to add them to the ZIP/XPI
-	signedFile, err = repackJAR(input, manifest, sigfile, p7sig)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: failed to repack XPI")
-	}
-	return signedFile, nil
-}
-
-func (s *PKCS7Signer) signDataCOSE(manifest []byte, eeCert *x509.Certificate, eeKey crypto.PrivateKey) (msg *cose.SignMessage, err error) {
+func (s *COSESigner) signData(manifest []byte, eeCert *x509.Certificate, eeKey crypto.PrivateKey) (msg *cose.SignMessage, err error) {
 	// create a slot for a COSE Signature
 	sig := cose.NewSignature()
 	sig.Headers.Protected["alg"] = "PS256" // TODO: parameterize
-	sig.Headers.Protected["kid"] = "<DER encoded cert chain>" // NB: double check that kid should be in protected
+	sig.Headers.Protected["kid"] = "<DER encoded cert chain>" // NB: kid should be in protected
 
 	tmp := cose.NewSignMessage([]byte(""))
 	msg = &tmp
@@ -366,7 +380,6 @@ func (s *PKCS7Signer) signDataCOSE(manifest []byte, eeCert *x509.Certificate, ee
 	}
 
 	// don't include signature in payload
-	// TODO: are we not using external bytes because it requires rolling our own authentication?
 	msg.Payload = nil
 
 	return
