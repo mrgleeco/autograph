@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"go.mozilla.org/cose"
 )
 
 // every minute, add an rsa key to the cache. This will block if
@@ -133,6 +134,34 @@ const (
 	keyTypeECDSA KeyType = iota
 )
 
+
+func getKeyOptionsForCOSEAlg(alg *cose.Algorithm) (*keyOptions) {
+	switch alg {
+	case cose.GetAlgByNameOrPanic("ES256"):
+		return &keyOptions{
+			keyType: keyTypeECDSA,
+			ecdsaCurve: elliptic.P256(),
+		}
+	case cose.GetAlgByNameOrPanic("ES384"):
+		return &keyOptions{
+			keyType: keyTypeECDSA,
+			ecdsaCurve: elliptic.P384(),
+		}
+	case cose.GetAlgByNameOrPanic("ES512"):
+		return &keyOptions{
+			keyType: keyTypeECDSA,
+			ecdsaCurve: elliptic.P521(),
+		}
+	case cose.GetAlgByNameOrPanic("PS256"):
+		return &keyOptions{
+			keyType: keyTypeRSA,
+			rsaBits: 2048, // TODO: fixme
+		}
+	default:
+		return nil
+	}
+}
+
 // keyOptions
 type keyOptions struct {
 	keyType KeyType
@@ -148,7 +177,7 @@ type keyOptions struct {
 // MakeEndEntity but returns the DER encoded certificate bytes instead
 // of a X.509 certificate and takes additional options to generate EEs
 // using different key types or params than the issuer cert
-func (s *PKCS7Signer) MakeDEREndEntity(cn string, opts keyOptions) (eeDERCert []byte, eeKey crypto.PrivateKey, err error) {
+func (s *PKCS7Signer) MakeDEREndEntity(cn string, opts *keyOptions) (eeDERCert []byte, eeKey crypto.PrivateKey, err error) {
 	var eePublicKey crypto.PublicKey
 	template := s.makeTemplate(cn)
 	size := opts.rsaBits

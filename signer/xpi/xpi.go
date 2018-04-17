@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -36,12 +39,11 @@ const (
 	// ModeHotFix represents a signer that issues signatures for
 	// Firefox HotFixes
 	ModeHotFix = "hotfix"
-
-	// SubSignerType all subsigners must be this type
-	SubSignerType = "cose"
 )
 
-type EESignerConfig struct {
+// A PKCS7Signer is configured to issue PKCS7 detached signatures
+// for Firefox Add-ons of various types.
+type PKCS7Signer struct {
 	signer.Configuration
 	issuerKey  crypto.PrivateKey
 	issuerCert *x509.Certificate
@@ -55,94 +57,152 @@ type EESignerConfig struct {
 	// the ID will be left blank and provided by the requester of the
 	// signature, but for hotfix signers, it is set to a specific value.
 	EndEntityCN string
-}
-
-// A PKCS7Signer is configured to issue PKCS7 detached signatures
-// for Firefox Add-ons of various types.
-type PKCS7Signer struct {
-	EESignerConfig
 
 	// rsa cache is used to pre-generate RSA private keys and speed up
 	// the signing process
 	rsaCache chan *rsa.PrivateKey
 }
 
-// A COSESigner adds COSE signatures to a SignMessage
-type COSESigner struct {
-	EESignerConfig
-
-	// the COSE Algorithm to use for signing
-	alg cose.Algorithm
-}
-
-// An XPISigner issues COSE signatures and an optional PKCS7 detached
-// signature for Firefox Add-ons.
-type XPISigner struct {
-	maybePKCS7Signer *PKCS7Signer
-	coseSigners []COSESigner
-}
-
-func (s *XPISigner) Config() signer.Configuration {
-	if s.maybePKCS7Signer != nil {
-		return s.maybePKCS7Signer.Config()
-	} else {
-		panic("not implemented")
+// isCOSEAlgBad checks whether a COSE algorithm is recognized as a
+// valid IANA algorithm name, and supported and enabled in autograph
+func isCOSEAlgBad(algName string) (alg *cose.Algorithm, err error) {
+	alg, algErr := cose.GetAlgByName(algName)
+	if err != nil {
+		err = errors.Wrapf(algErr, "xpi: unrecognized algorithm COSE Signing algorithm")
+		return
 	}
+	if _, exists := supportedCOSEAlgorithms[alg]; !exists {
+		err = errors.Wrapf(algErr, "xpi: COSE algorithm is not supported")
+		return
+	}
+	return alg, nil
 }
+
 // SignFile takes an unsigned zipped XPI file and returns a signed XPI file
-func (s *XPISigner) SignFile(input []byte, options interface{}) (signer.SignedFile, error) {
+func (s *PKCS7Signer) SignFile(input []byte, options interface{}) (signedFile signer.SignedFile, err error) {
 	var (
-		signedFile []byte
 		pkcs7manifest []byte
 		manifest []byte
 		metas = []Metafile{}
+		opt Options
+		coseSigAlgs []*cose.Algorithm // COSE algorithms to sign with
 	)
-	manifest, err := makeJARManifest(input)
+
+	opt, err = GetOptions(options)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: cannot get options")
+	}
+	for _, algName := range opt.COSEAlgorithms {
+		alg, err := isCOSEAlgBad(algName)
+		if err != nil {
+			return nil, err
+		}
+		coseSigAlgs = append(coseSigAlgs, alg)
+	}
+
+	manifest, err = makeJARManifest(input)
 	if err != nil {
 		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest from XPI")
 	}
 
-	// TODO: generate EEs for each issuerID based on xpi subsigner configs and same IDs should return the same EE
-	// TODO: move from method from pkcs7signer (to handle when it is nil)
-	eeCert, eeKey, err := s.maybePKCS7Signer.makeEE(options)
+	if len(coseSigAlgs) > 0 {
+		cn := opt.ID
+		if s.EndEntityCN != "" {
+			cn = s.EndEntityCN
+		}
+		if cn == "" {
+			return nil, errors.New("xpi: missing common name")
+		}
+		tmp := cose.NewSignMessage(manifest)
+		msg := &tmp
+
+		var coseSigners []*cose.Signer
+
+		for _, alg := range coseSigAlgs {
+			// create a cert and key
+			eeDERCert, eeKey, err := s.MakeDEREndEntity(cn, getKeyOptionsForCOSEAlg(alg))
+			if err != nil {
+				return nil, err
+			}
+
+			// create a COSE.Signer
+			signer, err := cose.NewSigner(&eeKey)
+			if err != nil {
+				return nil, errors.Wrap(err, "xpi: COSE signer creation failed")
+			}
+
+			// create a slot for a COSE Signature
+			sig := cose.NewSignature()
+			sig.Headers.Protected["alg"] = alg.Name
+			// TODO: add DER encoded intermediate public key
+			sig.Headers.Protected["kid"] = eeDERCert // NB: kid should be in protected
+
+			msg.AddSignature(sig)
+			coseSigners = append(coseSigners, signer)
+		}
+
+		external := []byte("")
+		randReader := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+		err = msg.Sign(randReader, external, cose.SignOpts{
+			GetSigner: func(index int, signature cose.Signature) (cose.Signer, error) {
+				return *coseSigners[index], nil
+			},
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "xpi: COSE signing failed")
+		}
+		// don't include signature in payload
+		msg.Payload = nil
+
+		coseSig, err := cose.Marshal(msg)
+		if err != nil {
+			return nil, errors.Wrap(err, "xpi: error serializing COSE signatures to CBOR")
+		}
+
+		// add the cose files to the metafiles we'll add to the zipfile
+		coseMetaFiles := []Metafile{
+			{"META-INF/cose.manifest", manifest},
+			{"META-INF/cose.sig", coseSig},
+		}
+		metas = append(metas, coseMetaFiles...)
+
+		// add entries for the cose files to the manifest as cose.manifest and cose.sig
+		mw := bytes.NewBuffer(manifest)
+		for _, f := range coseMetaFiles {
+			fmt.Fprintf(mw, "Name: %s\nDigest-Algorithms: SHA1 SHA256\n", f.Name)
+			h1 := sha1.New()
+			h1.Write(f.Body)
+			fmt.Fprintf(mw, "SHA1-Digest: %s\n", base64.StdEncoding.EncodeToString(h1.Sum(nil)))
+			h2 := sha256.New()
+			h2.Write(f.Body)
+			fmt.Fprintf(mw, "SHA256-Digest: %s\n\n", base64.StdEncoding.EncodeToString(h2.Sum(nil)))
+		}
+		pkcs7manifest = mw.Bytes()
+	} else {
+		pkcs7manifest = manifest
+	}
+
+	sigfile, err := makeJARSignature(pkcs7manifest)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
+	}
+
+	eeCert, eeKey, err := s.makeEE(opt)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(s.coseSigners) > 0 {
-		for _, coseSigner := range s.coseSigners {
-			coseSigner.signData(manifest, eeCert, eeKey)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		metas = append(metas, []Metafile{
-			{"META-INF/cose.manifest", manifest},
-			{"META-INF/cose.sig", cose.Marshal(msg)},
-		}...)
+	p7sig, err := s.signDataWithEE(sigfile, eeCert, eeKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: failed to sign XPI")
 	}
-	if s.maybePKCS7Signer != nil {
-		// TODO: add the cose files to the zipfile
-		// TODO: add entries for the cose files to the manifest as cose.manifest and cose.sig
-		// manifestWithCoseFiles :=
 
-		sigfile, err := makeJARSignature(manifestWithCoseFiles)
-		if err != nil {
-			return nil, errors.Wrap(err, "xpi: cannot make JAR manifest signature from XPI")
-		}
-
-		p7sig, err := s.maybePKCS7Signer.signDataWithEE(sigfile, eeCert, eeKey)
-		if err != nil {
-			return nil, errors.Wrap(err, "xpi: failed to sign XPI")
-		}
-
-		metas = append(metas, []Metafile{
-			{"META-INF/manifest.mf", manifest},
-			{"META-INF/mozilla.sf", sigfile},
-			{"META-INF/mozilla.rsa", p7sig},
-		}...)
-	}
+	metas = append(metas, []Metafile{
+		{"META-INF/manifest.mf", manifest},
+		{"META-INF/mozilla.sf", sigfile},
+		{"META-INF/mozilla.rsa", p7sig},
+	}...)
 
 	signedFile, err = repackJARWithMetafiles(input, metas)
 	if err != nil {
@@ -151,15 +211,8 @@ func (s *XPISigner) SignFile(input []byte, options interface{}) (signer.SignedFi
 	return signedFile, nil
 }
 
-func (s *XPISigner) SignData(sigfile []byte, options interface{}) (signer.Signature, error) {
-	if s.maybePKCS7Signer != nil {
-		return s.maybePKCS7Signer.SignData(sigfile, options)
-	} else {
-		panic("not implemented")
-	}
-}
-
-func newPKCS7Signer(conf signer.Configuration) (s *PKCS7Signer, err error) {
+// New initializes an new signer using a configuration
+func New(conf signer.Configuration) (s *PKCS7Signer, err error) {
 	s = new(PKCS7Signer)
 	if conf.Type != Type {
 		return nil, errors.Errorf("xpi: invalid type %q, must be %q", conf.Type, Type)
@@ -231,111 +284,11 @@ func newPKCS7Signer(conf signer.Configuration) (s *PKCS7Signer, err error) {
 	return
 }
 
-// New initializes an XPI signer using a configuration
-func New(conf signer.Configuration) (s *XPISigner, err error) {
-	var (
-		pkcs7Signer *PKCS7Signer
-	)
-	s = new(XPISigner)
-
-	if len(conf.COSESigners) > 0 {
-		for _, coseConf := range conf.COSESigners {
-			coseSigner, coseErr := newCOSESigner(coseConf)
-			if coseErr != nil {
-				err = errors.Wrapf(coseErr, "xpi: error parsing COSESigner conf")
-				return
-			}
-			s.coseSigners = append(s.coseSigners, *coseSigner)
-		}
-	}
-
-	pkcs7Signer, err = newPKCS7Signer(conf)
-	if err != nil && len(s.coseSigners) < 1 {  // errors are OK if we have a COSESigner
-		err = err
-		return
-	} else if err == nil {
-		s.maybePKCS7Signer = pkcs7Signer
-	}
-
-	return
-}
-
 var supportedCOSEAlgorithms = map[*cose.Algorithm]bool{
 	cose.GetAlgByNameOrPanic("PS256"): true,
 	cose.GetAlgByNameOrPanic("ES256"): true,
 	cose.GetAlgByNameOrPanic("ES384"): true,
 	cose.GetAlgByNameOrPanic("ES512"): true,
-}
-
-func newCOSESigner(conf signer.Configuration) (s *COSESigner, err error) {
-	if conf.Type != SubSignerType {
-		return nil, errors.Errorf("xpi: invalid sub signer type %q, must be %q", conf.Type, SubSignerType)
-	}
-	s.Type = conf.Type
-	if conf.PrivateKey == "" {
-		return nil, errors.New("xpi: missing private key in sub signer configuration")
-	}
-	s.PrivateKey = conf.PrivateKey
-	s.issuerKey, err = signer.ParsePrivateKey([]byte(conf.PrivateKey))
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: failed to parse private key")
-	}
-	block, _ := pem.Decode([]byte(conf.Certificate))
-	if block == nil {
-		return nil, errors.New("xpi: failed to parse certificate PEM")
-	}
-	s.issuerCert, err = x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: could not parse X.509 certificate")
-	}
-	// some sanity checks for the signer cert
-	if !s.issuerCert.IsCA {
-		return nil, errors.New("xpi: sub signer certificate must have CA constraint set to true")
-	}
-	if time.Now().Before(s.issuerCert.NotBefore) || time.Now().After(s.issuerCert.NotAfter) {
-		return nil, errors.New("xpi: sub signer certificate is not currently valid")
-	}
-	if s.issuerCert.KeyUsage&x509.KeyUsageCertSign == 0 {
-		return nil, errors.New("xpi: sub signer certificate is missing certificate signing key usage")
-	}
-	hasCodeSigning := false
-	for _, eku := range s.issuerCert.ExtKeyUsage {
-		if eku == x509.ExtKeyUsageCodeSigning {
-			hasCodeSigning = true
-			break
-		}
-	}
-	if !hasCodeSigning {
-		return nil, errors.New("xpi: sub signer certificate does not have code signing EKU")
-	}
-	switch conf.Mode {
-	case ModeAddOn:
-		s.OU = "Production"
-	case ModeExtension:
-		s.OU = "Mozilla Extensions"
-	case ModeSystemAddOn:
-		s.OU = "Mozilla Components"
-	case ModeHotFix:
-		// FIXME: this also needs to pin the signing key somehow
-		s.OU = "Production"
-		s.EndEntityCN = "firefox-hotfix@mozilla.org"
-	default:
-		return nil, errors.Errorf("xpi: unknown signer mode %q, must be 'add-on', 'extension', 'system add-on' or 'hotfix'", conf.Mode)
-	}
-	s.Mode = conf.Mode
-
-	// COSE Alg validation
-	alg, algErr := cose.GetAlgByName(string(conf.Algorithm))
-	if algErr != nil {
-		err = errors.Wrapf(algErr, "xpi: unrecognized algorithm COSE Signing algorithm")
-		return
-	}
-	if _, exists := supportedCOSEAlgorithms[alg]; !exists {
-		err = errors.Wrapf(algErr, "xpi: COSE algorithm is not supported")
-		return
-	}
-
-	return
 }
 
 // Config returns the configuration of the current signer
@@ -347,42 +300,6 @@ func (s *PKCS7Signer) Config() signer.Configuration {
 		PrivateKey:  s.PrivateKey,
 		Certificate: s.Certificate,
 	}
-}
-
-func (s *COSESigner) signData(manifest []byte, eeCert *x509.Certificate, eeKey crypto.PrivateKey) (msg *cose.SignMessage, err error) {
-	// create a slot for a COSE Signature
-	sig := cose.NewSignature()
-	sig.Headers.Protected["alg"] = "PS256" // TODO: parameterize
-	sig.Headers.Protected["kid"] = "<DER encoded cert chain>" // NB: kid should be in protected
-
-	tmp := cose.NewSignMessage([]byte(""))
-	msg = &tmp
-	msg.Payload = manifest
-	msg.AddSignature(sig)
-
-	external := []byte("")
-	randReader := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	// create a COSE.Signer
-	signer, err := cose.NewSigner(&eeKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: COSE signer creation failed")
-	}
-
-	err = msg.Sign(randReader, external, cose.SignOpts{
-		HashFunc: crypto.SHA256,
-		GetSigner: func(index int, signature cose.Signature) (cose.Signer, error) {
-			return *signer, nil
-		},
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "xpi: COSE signing failed")
-	}
-
-	// don't include signature in payload
-	msg.Payload = nil
-
-	return
 }
 
 // SignData takes an input signature file and returns a PKCS7 detached signature
@@ -397,11 +314,7 @@ func (s *PKCS7Signer) SignData(sigfile []byte, options interface{}) (signer.Sign
 	return sig, nil
 }
 
-func (s *PKCS7Signer) makeEE(options interface{}) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
-	opt, err := GetOptions(options)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "xpi: cannot get options")
-	}
+func (s *PKCS7Signer) makeEE(opt Options) (eeCert *x509.Certificate, eeKey crypto.PrivateKey, err error) {
 	cn := opt.ID
 	if s.EndEntityCN != "" {
 		cn = s.EndEntityCN
@@ -436,7 +349,12 @@ func (s *PKCS7Signer) signDataWithEE(sigfile []byte, eeCert *x509.Certificate, e
 }
 
 func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, error) {
-	eeCert, eeKey, err := s.makeEE(options)
+	opt, err := GetOptions(options)
+	if err != nil {
+		return nil, errors.Wrap(err, "xpi: cannot get options")
+	}
+
+	eeCert, eeKey, err := s.makeEE(opt)
 	if err != nil {
 		return nil, err
 	}
@@ -447,10 +365,13 @@ func (s *PKCS7Signer) signData(sigfile []byte, options interface{}) ([]byte, err
 type Options struct {
 	// ID is the add-on ID which is stored in the end-entity subject CN
 	ID string `json:"id"`
+
+	// COSEAlgorithms is a list of strings referring to IANA algorithms to use for COSE signatures
+	COSEAlgorithms []string `json:"cose_algorithms"`
 }
 
 // GetDefaultOptions returns default options of the signer
-func (s *XPISigner) GetDefaultOptions() interface{} {
+func (s *PKCS7Signer) GetDefaultOptions() interface{} {
 	return Options{ID: "test@example.net"}
 }
 
