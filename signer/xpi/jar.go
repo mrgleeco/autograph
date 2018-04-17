@@ -88,7 +88,8 @@ func makeJARSignature(manifest []byte) (sigfile []byte, err error) {
 	return
 }
 
-// manifest, sigfile, coseManifest, coseSig, signature
+// Metafile is a file to pack into a JAR at .Name with contents .Body
+// .Name should begin with META-INF/ but this is not checked
 type Metafile struct {
 	Name string
 	Body []byte
